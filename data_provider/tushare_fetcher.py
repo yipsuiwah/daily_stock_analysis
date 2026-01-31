@@ -104,7 +104,7 @@ class TushareFetcher(BaseFetcher):
         根据 Token 配置和 API 初始化状态确定优先级
 
         策略：
-        - Token 配置且 API 初始化成功：优先级 0（最高）
+        - Token 配置且 API 初始化成功：优先级 -1（绝对最高，优于 efinance）
         - 其他情况：优先级 2（默认）
 
         Returns:
@@ -114,8 +114,8 @@ class TushareFetcher(BaseFetcher):
 
         if config.tushare_token and self._api is not None:
             # Token 配置且 API 初始化成功，提升为最高优先级
-            logger.info("✅ 检测到 TUSHARE_TOKEN 且 API 初始化成功，Tushare 数据源优先级提升为最高 (Priority 0)")
-            return 0
+            logger.info("✅ 检测到 TUSHARE_TOKEN 且 API 初始化成功，Tushare 数据源优先级提升为最高 (Priority -1)")
+            return -1
 
         # Token 未配置或 API 初始化失败，保持默认优先级
         return 2
@@ -299,6 +299,198 @@ class TushareFetcher(BaseFetcher):
         
         return df
 
+    def get_stock_name(self, stock_code: str) -> Optional[str]:
+        """
+        获取股票名称
+        
+        使用 Tushare 的 stock_basic 接口获取股票基本信息
+        
+        Args:
+            stock_code: 股票代码
+            
+        Returns:
+            股票名称，失败返回 None
+        """
+        if self._api is None:
+            logger.warning("Tushare API 未初始化，无法获取股票名称")
+            return None
+        
+        # 检查缓存
+        if hasattr(self, '_stock_name_cache') and stock_code in self._stock_name_cache:
+            return self._stock_name_cache[stock_code]
+        
+        # 初始化缓存
+        if not hasattr(self, '_stock_name_cache'):
+            self._stock_name_cache = {}
+        
+        try:
+            # 速率限制检查
+            self._check_rate_limit()
+            
+            # 转换代码格式
+            ts_code = self._convert_stock_code(stock_code)
+            
+            # 调用 stock_basic 接口
+            df = self._api.stock_basic(
+                ts_code=ts_code,
+                fields='ts_code,name'
+            )
+            
+            if df is not None and not df.empty:
+                name = df.iloc[0]['name']
+                self._stock_name_cache[stock_code] = name
+                logger.debug(f"Tushare 获取股票名称成功: {stock_code} -> {name}")
+                return name
+            
+        except Exception as e:
+            logger.warning(f"Tushare 获取股票名称失败 {stock_code}: {e}")
+        
+        return None
+    
+    def get_stock_list(self) -> Optional[pd.DataFrame]:
+        """
+        获取股票列表
+        
+        使用 Tushare 的 stock_basic 接口获取全部股票列表
+        
+        Returns:
+            包含 code, name 列的 DataFrame，失败返回 None
+        """
+        if self._api is None:
+            logger.warning("Tushare API 未初始化，无法获取股票列表")
+            return None
+        
+        try:
+            # 速率限制检查
+            self._check_rate_limit()
+            
+            # 调用 stock_basic 接口获取所有股票
+            df = self._api.stock_basic(
+                exchange='',
+                list_status='L',
+                fields='ts_code,name,industry,area,market'
+            )
+            
+            if df is not None and not df.empty:
+                # 转换 ts_code 为标准代码格式
+                df['code'] = df['ts_code'].apply(lambda x: x.split('.')[0])
+                
+                # 更新缓存
+                if not hasattr(self, '_stock_name_cache'):
+                    self._stock_name_cache = {}
+                for _, row in df.iterrows():
+                    self._stock_name_cache[row['code']] = row['name']
+                
+                logger.info(f"Tushare 获取股票列表成功: {len(df)} 条")
+                return df[['code', 'name', 'industry', 'area', 'market']]
+            
+        except Exception as e:
+            logger.warning(f"Tushare 获取股票列表失败: {e}")
+        
+        return None
+    
+    def get_realtime_quote(self, stock_code: str) -> Optional[dict]:
+        """
+        获取实时行情
+
+        策略：
+        1. 优先尝试 Pro 接口（需要2000积分）：数据全，稳定性高
+        2. 失败降级到旧版接口：门槛低，数据较少
+
+        Args:
+            stock_code: 股票代码
+
+        Returns:
+            UnifiedRealtimeQuote 对象，失败返回 None
+        """
+        if self._api is None:
+            return None
+
+        from .realtime_types import (
+            UnifiedRealtimeQuote, RealtimeSource,
+            safe_float, safe_int
+        )
+
+        # 速率限制检查
+        self._check_rate_limit()
+
+        # 尝试 Pro 接口
+        try:
+            ts_code = self._convert_stock_code(stock_code)
+            # 尝试调用 Pro 实时接口 (需要积分)
+            df = self._api.quotation(ts_code=ts_code)
+
+            if df is not None and not df.empty:
+                row = df.iloc[0]
+                logger.debug(f"Tushare Pro 实时行情获取成功: {stock_code}")
+
+                return UnifiedRealtimeQuote(
+                    code=stock_code,
+                    name=str(row.get('name', '')),
+                    source=RealtimeSource.TUSHARE,
+                    price=safe_float(row.get('price')),
+                    change_pct=safe_float(row.get('pct_chg')),  # Pro 接口通常直接返回涨跌幅
+                    change_amount=safe_float(row.get('change')),
+                    volume=safe_int(row.get('vol')),
+                    amount=safe_float(row.get('amount')),
+                    high=safe_float(row.get('high')),
+                    low=safe_float(row.get('low')),
+                    open_price=safe_float(row.get('open')),
+                    pre_close=safe_float(row.get('pre_close')),
+                    turnover_rate=safe_float(row.get('turnover_ratio')), # Pro 接口可能有换手率
+                    pe_ratio=safe_float(row.get('pe')),
+                    pb_ratio=safe_float(row.get('pb')),
+                    total_mv=safe_float(row.get('total_mv')),
+                )
+        except Exception as e:
+            # 仅记录调试日志，不报错，继续尝试降级
+            logger.debug(f"Tushare Pro 实时行情不可用 (可能是积分不足): {e}")
+
+        # 降级：尝试旧版接口
+        try:
+            import tushare as ts
+
+            # Tushare 旧版接口使用 6 位代码
+            code_6 = stock_code.split('.')[0] if '.' in stock_code else stock_code
+
+            # 调用旧版实时接口 (ts.get_realtime_quotes)
+            df = ts.get_realtime_quotes(code_6)
+
+            if df is None or df.empty:
+                return None
+
+            row = df.iloc[0]
+
+            # 计算涨跌幅
+            price = safe_float(row['price'])
+            pre_close = safe_float(row['pre_close'])
+            change_pct = 0.0
+            change_amount = 0.0
+
+            if price and pre_close and pre_close > 0:
+                change_amount = price - pre_close
+                change_pct = (change_amount / pre_close) * 100
+
+            # 构建统一对象
+            return UnifiedRealtimeQuote(
+                code=stock_code,
+                name=str(row['name']),
+                source=RealtimeSource.TUSHARE,
+                price=price,
+                change_pct=round(change_pct, 2),
+                change_amount=round(change_amount, 2),
+                volume=safe_int(row['volume']) // 100,  # 转换为手
+                amount=safe_float(row['amount']),
+                high=safe_float(row['high']),
+                low=safe_float(row['low']),
+                open_price=safe_float(row['open']),
+                pre_close=pre_close,
+            )
+
+        except Exception as e:
+            logger.warning(f"Tushare (旧版) 获取实时行情失败 {stock_code}: {e}")
+            return None
+
 
 if __name__ == "__main__":
     # 测试代码
@@ -307,8 +499,14 @@ if __name__ == "__main__":
     fetcher = TushareFetcher()
     
     try:
+        # 测试历史数据
         df = fetcher.get_daily_data('600519')  # 茅台
         print(f"获取成功，共 {len(df)} 条数据")
         print(df.tail())
+        
+        # 测试股票名称
+        name = fetcher.get_stock_name('600519')
+        print(f"股票名称: {name}")
+        
     except Exception as e:
         print(f"获取失败: {e}")
